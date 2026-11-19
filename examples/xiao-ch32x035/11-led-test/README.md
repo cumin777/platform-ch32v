@@ -11,7 +11,10 @@
 - **User LED**（D7 绿，PA4 低有效）：1Hz 闪烁（500ms 亮 / 500ms 灭），上电即跑
 - **WS2812 RGB**（WS2812B-2020-V6，DIN=PB8）：红→绿→蓝→白→灭循环，每色 1s，插 USB 即可目视判定
 - **调试打印**：USART1 TX=PB10（XIAO D6），115200 8N1，每换色一行 `RGB: <COLOR> frame=<n>`，仅打印不接收
-- **驱动**：bit-bang——每帧 30µs 关中断，`mcycle` CSR 周期锚定脉宽，BSHR 原子沿；时序常量在 `src/ws2812_bitbang.h` 顶部单点可调
+- **启动自检灯语**（绿灯）：3 快闪 → 2 快闪 → RGB 白闪 → 2 快闪 → 2 快闪 → 正常轮换；"双闪+长停顿" = 板在 TinyUF2 bootloader DFU（app 未运行）
+- **驱动**：bit-bang——每帧 30µs 关中断，脉宽用 **millis() 自校准的减一循环延时**（`csrr mcycle` 在 QingKe V4C 上触发非法指令异常，禁用），BSHR 原子沿；帧间阻塞式节奏，勿用可追帧调度；时序常量在 `src/ws2812_bitbang.h` 顶部单点可调
+
+上板验证通过（2026-11-19）。
 
 ## 编译
 

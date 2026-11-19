@@ -1,15 +1,16 @@
 /*
  * ws2812_bitbang.c - see ws2812_bitbang.h for the route rationale.
  *
- * Hard timing requirements (why plain digitalWrite is unusable here):
+ * Timing rules (why plain digitalWrite is unusable here):
  *  - digitalWrite() does pin-table lookups, far slower than the 300ns
  *    T0H pulse. Edges are written straight to GPIO BSHR: one store sets
  *    or clears the pin atomically.
- *  - delayMicroseconds() has 1us granularity; the pulses are sub-us.
- *    Waits are anchored to the mcycle CSR instead: read the counter
- *    once per bit, then spin until (now - start) reaches the target.
- *    Loop/branch overhead is absorbed by the anchor, only the poll
- *    granularity (a few cycles) lands on top of the pulse width.
+ *  - Pulses are sub-microsecond, so the delay loop below is calibrated
+ *    at boot: ws2812_calibrate() counts how many loop iterations fit
+ *    into a 50ms window measured by millis(). The measured rate absorbs
+ *    the real per-iteration cost (pipeline, taken-branch penalty, flash
+ *    wait states); only the few cycles of fixed store overhead inside
+ *    each pulse stay uncalibrated, which the lowered NS targets cover.
  */
 #include "ws2812_bitbang.h"
 
@@ -17,12 +18,18 @@ static GPIO_TypeDef *ws_port;
 static uint16_t ws_set_mask; /* BSHR bits [15:0]: atomic set   */
 static uint32_t ws_clr_mask; /* BSHR bits [31:16]: atomic reset */
 
-/* Read the free-running 32-bit cycle counter (1 count = 1/F_CPU). */
-static inline uint32_t ws_cycle(void)
+static uint32_t ws_per_ms;      /* measured delay-loop iterations per ms */
+static uint32_t ws_t0h_iters;
+static uint32_t ws_t1h_iters;
+static uint32_t ws_bit_iters;
+
+/* Two-instruction decrement loop; per-iteration cost is calibrated, not
+ * assumed (2 or 3 cycles depending on core/flash, does not matter). */
+static inline void ws_dly(uint32_t n)
 {
-    uint32_t c;
-    __asm volatile("csrr %0, mcycle" : "=r"(c) : /* no inputs */ : "memory");
-    return c;
+    __asm volatile("1: addi %0, %0, -1\n"
+                   "   bnez %0, 1b"
+                   : "+r"(n));
 }
 
 void ws2812_attach(GPIO_TypeDef *port, uint8_t pin_num)
@@ -33,21 +40,46 @@ void ws2812_attach(GPIO_TypeDef *port, uint8_t pin_num)
     port->BSHR = ws_clr_mask; /* DIN low = idle / reset level */
 }
 
+void ws2812_calibrate(void)
+{
+    uint32_t start, end, n = 0;
+
+    /* Land on a millis() tick edge, then count iterations over 50ms.
+     * Quantization error stays within 1-2 ticks => < 4%. */
+    start = millis();
+    while (millis() == start) {
+        /* wait for tick */
+    }
+    end = start + 50;
+    while ((int32_t)(millis() - end) < 0) {
+        ws_dly(1000);
+        n += 1000;
+    }
+    ws_per_ms = n / 50;
+
+    ws_t0h_iters = (uint32_t)((uint64_t)ws_per_ms * WS2812_T0H_NS / 1000000);
+    ws_t1h_iters = (uint32_t)((uint64_t)ws_per_ms * WS2812_T1H_NS / 1000000);
+    ws_bit_iters = (uint32_t)((uint64_t)ws_per_ms * WS2812_BIT_NS / 1000000);
+    if (ws_t0h_iters == 0) ws_t0h_iters = 1;
+    if (ws_t1h_iters < ws_t0h_iters + 1) ws_t1h_iters = ws_t0h_iters + 1;
+    if (ws_bit_iters < ws_t1h_iters + 1) ws_bit_iters = ws_t1h_iters + 1;
+}
+
+uint32_t ws2812_iters_per_ms(void)
+{
+    return ws_per_ms;
+}
+
 /* One WS2812 bit: high pulse (length depends on the bit value), then low
- * for the rest of the 1.25us slot, both anchored to the same start count. */
+ * for the rest of the 1.25us slot. */
 static void ws2812_bit(uint8_t bit)
 {
-    uint32_t start = ws_cycle();
-    uint32_t high = bit ? WS2812_T1H_CYCLES : WS2812_T0H_CYCLES;
+    uint32_t high = bit ? ws_t1h_iters : ws_t0h_iters;
 
     ws_port->BSHR = ws_set_mask;
-    while ((int32_t)(ws_cycle() - start) < (int32_t)high) {
-        /* spin */
-    }
+    ws_dly(high);
     ws_port->BSHR = ws_clr_mask;
-    while ((int32_t)(ws_cycle() - start) < (int32_t)WS2812_BIT_CYCLES) {
-        /* spin */
-    }
+    ws_dly(ws_bit_iters - high);
 }
 
 void ws2812_send_rgb(uint8_t r, uint8_t g, uint8_t b)
